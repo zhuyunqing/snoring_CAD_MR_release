@@ -1,0 +1,926 @@
+########
+#By Yunqing Zhu, Canqing Yu
+#Email: zhuyun_qing@126.com yucanqing@pku.edu.cn
+#########
+
+
+library(data.table)
+library(TwoSampleMR)
+library(tidyverse)
+library(dbplyr)
+library(dplyr)
+library(LDlinkR)
+library(MRPRESSO)
+library(data.table)
+library(ggplot2)
+library(mr.raps)
+library('gsmr')
+
+#2 sample MR
+# setwd("D:/Software/R-4.1.3")
+# 
+# library(devtools)
+# #??装R-tools
+# write('PATH="${RTOOLS40_HOME}\\usr\\bin;${PATH}"', 
+#       file = "~/.Renviron", append = TRUE)
+# install.packages("devtools", type = "source")
+# install_github("MRCIEU/TwoSampleMR")
+# install.packages("randomForest")
+# install.packages("gsmr")
+
+
+#??图????
+mr_scatter_plot1 <- function (mr_results, dat) 
+{
+  requireNamespace("ggplot2", quietly = TRUE)
+  requireNamespace("plyr", quietly = TRUE)
+  mrres <- plyr::dlply(dat, c("id.exposure", "id.outcome"), 
+                       function(d) {
+                         d <- plyr::mutate(d)
+                         if (nrow(d) < 2 | sum(d$mr_keep) == 0) {
+                           return(blank_plot("Insufficient number of SNPs"))
+                         }
+                         d <- subset(d, mr_keep)
+                         index <- d$beta.exposure < 0
+                         d$beta.exposure[index] <- d$beta.exposure[index] * 
+                           -1
+                         d$beta.outcome[index] <- d$beta.outcome[index] * 
+                           -1
+                         mrres <- subset(mr_results, id.exposure == d$id.exposure[1] & 
+                                           id.outcome == d$id.outcome[1])
+                         mrres$a <- 0
+                         if ("MR Egger" %in% mrres$method) {
+                           temp <- mr_egger_regression(d$beta.exposure, 
+                                                       d$beta.outcome, d$se.exposure, d$se.outcome, 
+                                                       default_parameters())
+                           mrres$a[mrres$method == "MR Egger"] <- temp$b_i
+                         }
+                         if ("MR Egger (bootstrap)" %in% mrres$method) {
+                           temp <- mr_egger_regression_bootstrap(d$beta.exposure, 
+                                                                 d$beta.outcome, d$se.exposure, d$se.outcome, 
+                                                                 default_parameters())
+                           mrres$a[mrres$method == "MR Egger (bootstrap)"] <- temp$b_i
+                         }
+                         ggplot2::ggplot(data = d, ggplot2::aes(x = beta.exposure, 
+                                                                y = beta.outcome)) + ggplot2::geom_errorbar(ggplot2::aes(ymin = beta.outcome - 
+                                                                                                                           se.outcome, ymax = beta.outcome + se.outcome), 
+                                                                                                            colour = "black", width = 0) + ggplot2::geom_errorbarh(ggplot2::aes(xmin = beta.exposure - 
+                                                                                                                                                                                  se.exposure, xmax = beta.exposure + se.exposure), 
+                                                                                                                                                                   colour = "black", height = 0) + ggplot2::geom_point(size=1.3) + 
+                           ggplot2::geom_abline(data = mrres, ggplot2::aes(intercept = a, 
+                                                                           slope = b, colour = method), lwd = 0.8, show.legend = TRUE) + 
+                           ggplot2::scale_colour_manual(values = c("#1f78b4", "#a6cee3","#b2df8a", "#33a02c", 
+                                                                   "#fb9a99", "#e31a1c", "#fdbf6f", 
+                                                                   "#ff7f00", "#cab2d6", "#6a3d9a", 
+                                                                   "#ffff99", "#b15928")) + ggplot2::labs(colour = "MR Test", 
+                                                                                                          x = paste("SNP effect on", d$exposure[1]), 
+                                                                                                          y = paste("SNP effect on", d$outcome[1])) + theme_bw() +
+                           ggplot2::theme(legend.position = "top", 
+                                          legend.direction = "vertical", panel.grid.major=element_blank(),
+                                          panel.grid.minor=element_blank())  +  ggplot2::guides(colour = ggplot2::guide_legend(ncol = 2))
+                       })
+  mrres
+}
+
+
+
+mr_forest_plot1 <- 
+  function (singlesnp_results, exponentiate = FALSE) 
+  {
+    requireNamespace("ggplot2", quietly = TRUE)
+    requireNamespace("plyr", quietly = TRUE)
+    res <- plyr::dlply(singlesnp_results, c("id.exposure", 
+                                            "id.outcome"), function(d) {
+                                              d <- plyr::mutate(d)
+                                              if (sum(!grepl("All", d$SNP)) < 2) {
+                                                return(blank_plot("Insufficient number of SNPs"))
+                                              }
+                                              levels(d$SNP)[levels(d$SNP) == "All - Inverse variance weighted"] <- "All - IVW"
+                                              levels(d$SNP)[levels(d$SNP) == "All - MR Egger"] <- "All - Egger"
+                                              am <- grep("All", d$SNP, value = TRUE)
+                                              d$up <- d$b + 1.96 * d$se
+                                              d$lo <- d$b - 1.96 * d$se
+                                              d$tot <- 0.01
+                                              d$tot[d$SNP %in% am] <- 1
+                                              d$SNP <- as.character(d$SNP)
+                                              nom <- d$SNP[!d$SNP %in% am]
+                                              nom <- nom[order(d$b)]
+                                              d <- rbind(d, d[nrow(d), ])
+                                              d$SNP[nrow(d) - 1] <- ""
+                                              d$b[nrow(d) - 1] <- NA
+                                              d$up[nrow(d) - 1] <- NA
+                                              d$lo[nrow(d) - 1] <- NA
+                                              d$SNP <- ordered(d$SNP, levels = c(am, "", nom))
+                                              xint <- 0
+                                              if (exponentiate) {
+                                                d$b <- exp(d$b)
+                                                d$up <- exp(d$up)
+                                                d$lo <- exp(d$lo)
+                                                xint <- 1
+                                              }
+                                              ggplot2::ggplot(d, ggplot2::aes(y = SNP, x = b)) + ggplot2::geom_vline(xintercept = xint, 
+                                                                                                                     linetype = "dotted") + ggplot2::geom_errorbarh(ggplot2::aes(xmin = lo, 
+                                                                                                                                                                                 xmax = up, size = as.factor(tot), colour = as.factor(tot)), 
+                                                                                                                                                                    height = 0) + ggplot2::geom_point(ggplot2::aes(colour = as.factor(tot)), size=1.3) + 
+                                                ggplot2::geom_hline(ggplot2::aes(yintercept = which(levels(SNP) %in% 
+                                                                                                      "")), colour = "grey") + ggplot2::scale_colour_manual(values = c("black", 
+                                                                                                                                                                       "red")) + ggplot2::scale_size_manual(values = c(0.5, 
+                                                                                                                                                                                                                       1)) + theme_bw() + 
+                                                ggplot2::theme(legend.position = "none", 
+                                                               axis.text.y = ggplot2::element_text(size = 10), axis.ticks.y = ggplot2::element_line(size = 0), 
+                                                               axis.title.x = ggplot2::element_text(size = 11),panel.grid.major=element_blank(),
+                                                               panel.grid.minor=element_blank()) + 
+                                                ggplot2::labs(y = "", x = paste0("MR effect size for", " ",
+                                                                                 d$exposure[1], " on ", d$outcome[1]))
+                                            })
+    res
+  }
+
+
+mr_leaveoneout_plot1 <- 
+  function (leaveoneout_results) 
+  {
+    requireNamespace("ggplot2", quietly = TRUE)
+    requireNamespace("plyr", quietly = TRUE)
+    res <- plyr::dlply(leaveoneout_results, c("id.exposure", 
+                                              "id.outcome"), function(d) {
+                                                d <- plyr::mutate(d)
+                                                if (sum(!grepl("All", d$SNP)) < 3) {
+                                                  return(blank_plot("Insufficient number of SNPs"))
+                                                }
+                                                d$up <- d$b + 1.96 * d$se
+                                                d$lo <- d$b - 1.96 * d$se
+                                                d$tot <- 1
+                                                d$tot[d$SNP != "All"] <- 0.01
+                                                d$SNP <- as.character(d$SNP)
+                                                nom <- d$SNP[d$SNP != "All"]
+                                                nom <- nom[order(d$b)]
+                                                d <- rbind(d, d[nrow(d), ])
+                                                d$SNP[nrow(d) - 1] <- ""
+                                                d$b[nrow(d) - 1] <- NA
+                                                d$up[nrow(d) - 1] <- NA
+                                                d$lo[nrow(d) - 1] <- NA
+                                                d$SNP <- ordered(d$SNP, levels = c("All", "", nom))
+                                                ggplot2::ggplot(d, ggplot2::aes(y = SNP, x = b)) + ggplot2::geom_vline(xintercept = 0,linetype = "dotted") + 
+                                                  ggplot2::geom_errorbarh(ggplot2::aes(xmin = lo,xmax = up, size = as.factor(tot), colour = as.factor(tot)), height = 0) + 
+                                                  ggplot2::geom_point(ggplot2::aes(colour = as.factor(tot))) + 
+                                                  ggplot2::geom_hline(ggplot2::aes(yintercept = which(levels(SNP) %in%  "")), colour = "grey") + 
+                                                  ggplot2::scale_colour_manual(values = c("black", "red")) + 
+                                                  ggplot2::scale_size_manual(values = c(0.3, 1)) + 
+                                                  theme_bw() +
+                                                  ggplot2::theme(legend.position = "none",axis.text.y = ggplot2::element_text(size = 8), 
+                                                                 axis.ticks.y = ggplot2::element_line(size = 0), axis.title.x = ggplot2::element_text(size = 10), 
+                                                                 panel.grid.major=element_blank(), panel.grid.minor=element_blank()) + 
+                                                  ggplot2::labs(y = "", x = paste0("MR leave-one-out sensitivity analysis for\n", 
+                                                                                   d$exposure[1], " on ", d$outcome[1]))
+                                              })
+    res
+  }
+
+
+
+setwd("C:/Users/86132/Desktop/????")
+
+snoring <- read_exposure_data(filename = "C:/Users/86132/Desktop/????/snoring2CAD_check/data/togsmr_snoring3.txt",
+                              snp_col = "SNP",
+                              sep = "\t",
+                              beta_col = "b",
+                              se_col = "se",
+                              effect_allele_col = "A1",
+                              other_allele_col = "A2",
+                              eaf_col = "freq",
+                              pval_col = "p",
+                              samplesize_col = "N"
+)
+head(snoring)
+dim(snoring)
+
+
+exp_dat <- clump_data(snoring, clump_r2 = 0.001, 
+                      clump_kb = 10000, pop = "EAS")
+
+
+
+
+
+
+
+
+
+#AF
+AF <- read_outcome_data(snps = exp_dat$SNP,
+                        filename = "C:/Users/86132/Desktop/????/snoring2CAD_check/data/AF_meta_tsmr1.txt",
+                        sep = "\t",                          
+                        snp_col = "SNP",
+                        beta_col = "b",
+                        se_col = "se",
+                        effect_allele_col = "ALT",
+                        other_allele_col = "REF",
+                        eaf_col = "freq",
+                        pval_col = "P",
+                        samplesize_col = "n"
+)
+
+dat <- harmonise_data(exposure_dat = exp_dat, outcome_dat = AF)
+dat$outcome = "AF"
+
+
+#MR
+set.seed(1000)
+res <- mr(dat,method_list = c('mr_ivw',
+                              'mr_weighted_median',
+                              'mr_egger_regression'))
+res.raps <- mr.raps(b_exp = dat$beta.exposure,
+                    b_out = dat$beta.outcome,
+                    se_exp = dat$se.exposure,
+                    se_out = dat$se.outcome)
+res.raps.result <- c(res$id.exposure[1], res$id.outcome[1], res$outcome[1], res$exposure[1], "RAPS", res$nsnp[1], res.raps$beta.hat, res.raps$beta.se, res.raps$beta.p.value)
+res <- rbind(res, res.raps.result)
+res$b <- as.numeric(res$b)
+res$se <- as.numeric(res$se)
+res$nsnp <- as.numeric(res$nsnp)
+
+
+#???????? ln(1.5)?????????毡?为原来??1.5??时...
+res$OR.adj <- exp(res$b*0.405)
+res$OR.adj_L <- exp((res$b - 1.96*res$se)*0.405)
+res$OR.adj_U <- exp((res$b + 1.96*res$se)*0.405)
+
+result_AF<-cbind(res$method, res$nsnp, res$OR.adj, res$OR.adj_L, res$OR.adj_U,res$pval)
+
+colnames(result_AF) <- c("method","nsnp","OR.adj","OR.adj_L","OR.adj_U","P")
+rownames(result_AF) <- res$outcome 
+
+# set.seed(1000)
+# res <- mr(dat,method_list = c('mr_ivw_mre','mr_egger_regression',
+#                               'mr_weighted_median'))
+# res
+# 
+# 
+# #???????? ln(1.5)?????????毡?为原来??1.5??时...
+# res$OR.adj <- exp(res$b*0.405)
+# res$OR.adj_L <- exp((res$b - 1.96*res$se)*0.405)
+# res$OR.adj_U <- exp((res$b + 1.96*res$se)*0.405)
+# 
+# result_AF <- cbind(res$method, res$nsnp, res$OR.adj, res$OR.adj_L, res$OR.adj_U,res$pval)
+# 
+# colnames(result_AF) <- c("method","nsnp","OR.adj","OR.adj_L","OR.adj_U","P")
+# rownames(result_AF) <- c("AF", "AF", "AF") 
+
+
+#pleiotropy test
+pleio <- mr_pleiotropy_test(dat)
+pleio
+
+#heterogeneity test
+het <- mr_heterogeneity(dat)
+het
+
+#MR Steiger
+out <- directionality_test(dat)
+out
+kable(out)
+
+#F-Statistics
+R2=out$snp_r2.exposure
+n=dat$samplesize.exposure[1] #注???薷????????
+k=res$nsnp[1]
+F = R2/(1-R2) * (n-k-1)/k
+F
+
+test_AF <- cbind(pleio$exposure, pleio$outcome, F, pleio$egger_intercept, 
+                 pleio$se, pleio$pval, het$Q[2], het$Q_pval[2], out$snp_r2.exposure,
+                 out$snp_r2.outcome, out$correct_causal_direction, out$steiger_pval)
+colnames(test_AF) <- c("Exposure","Outcome","F","Egger.inter",
+                       "Egger.SE","P.inter","Q","P.heterogeneity","snp_r2.exposure",
+                       "snp_r2.outcome","Direction","P.Steiger")
+
+
+setwd("C:/Users/86132/Desktop/????/snoring2CAD_check/2sampleMR/plots")
+single <- mr_leaveoneout(dat, method = mr_ivw) #default????IVW
+single
+plot_leave1 <- mr_leaveoneout_plot1(single)
+plot_leave1
+ggsave(plot_leave1[[1]], file="snoring_AF_leaveoneout.pdf", width=7, height=7)
+
+p1<-mr_scatter_plot1(res, dat)
+p1
+ggsave(p1[[1]], file="snoring_AF_scatterplot.pdf", width=7, height=7)
+res_single <- mr_singlesnp(dat, all_method = c("mr_ivw"))
+p2 <- mr_forest_plot1(res_single)
+p2
+ggsave(p2[[1]], file="snoring_AF_singleplot.pdf", width=7, height=7)
+p3 <- mr_funnel_plot(res_single)
+p3
+
+
+
+
+
+
+
+
+
+
+
+
+#CAD
+setwd("C:/Users/86132/Desktop/????/snoring2CAD_check/data")
+CAD <- read_outcome_data(snps = exp_dat$SNP,
+                         filename = "CAD_BBJ_tsmr.txt",
+                         sep = "\t",                         
+                         snp_col = "SNP",
+                         beta_col = "b",
+                         se_col = "se",
+                         effect_allele_col = "A1",
+                         other_allele_col = "A2",
+                         eaf_col = "freq",
+                         pval_col = "P",
+                         samplesize_col = "n"
+)
+
+dat <- harmonise_data(exposure_dat = exp_dat, outcome_dat = CAD)
+dat$outcome ='CAD'
+
+#MR Analysis
+set.seed(1000)
+res <- mr(dat,method_list = c('mr_ivw',
+                              'mr_weighted_median',
+                              'mr_egger_regression'))
+res.raps <- mr.raps(b_exp = dat$beta.exposure,
+                    b_out = dat$beta.outcome,
+                    se_exp = dat$se.exposure,
+                    se_out = dat$se.outcome)
+res.raps.result <- c(res$id.exposure[1], res$id.outcome[1], res$outcome[1], res$exposure[1], "RAPS", res$nsnp[1], res.raps$beta.hat, res.raps$beta.se, res.raps$beta.p.value)
+res <- rbind(res, res.raps.result)
+res$b <- as.numeric(res$b)
+res$se <- as.numeric(res$se)
+res$nsnp <- as.numeric(res$nsnp)
+res$method[1] <- "Inverse variance weighted"
+
+
+#???????? ln(1.5)?????????毡?为原来??1.5??时...
+res$OR.adj <- exp(res$b*0.405)
+res$OR.adj_L <- exp((res$b - 1.96*res$se)*0.405)
+res$OR.adj_U <- exp((res$b + 1.96*res$se)*0.405)
+
+result_CAD<-cbind(res$method, res$nsnp, res$OR.adj, res$OR.adj_L, res$OR.adj_U,res$pval)
+
+colnames(result_CAD) <- c("method","nsnp","OR.adj","OR.adj_L","OR.adj_U","P")
+rownames(result_CAD) <- res$outcome 
+
+
+#pleiotropy test
+pleio <- mr_pleiotropy_test(dat)
+pleio
+
+#heterogeneity test
+het <- mr_heterogeneity(dat)
+het
+
+#MR Steiger
+out <- directionality_test(dat)
+out
+kable(out)
+
+#F-Statistics
+R2=out$snp_r2.exposure
+n=dat$samplesize.exposure[1] #注???薷????????
+k=res$nsnp[1]
+F = R2/(1-R2) * (n-k-1)/k
+F
+
+test_CAD <- cbind(pleio$exposure, pleio$outcome, F, pleio$egger_intercept, 
+                  pleio$se, pleio$pval, het$Q[2], het$Q_pval[2], out$snp_r2.exposure,
+                  out$snp_r2.outcome, out$correct_causal_direction, out$steiger_pval)
+colnames(test_CAD) <- c("Exposure","Outcome","F","Egger.inter",
+                        "Egger.SE","P.inter","Q","P.heterogeneity","snp_r2.exposure",
+                        "snp_r2.outcome","Direction","P.Steiger")
+
+
+setwd("C:/Users/86132/Desktop/????/snoring2CAD_check/2sampleMR/plots")
+single <- mr_leaveoneout(dat, method = mr_ivw) #default????IVW
+single
+plot_leave1 <- mr_leaveoneout_plot1(single)
+plot_leave1
+ggsave(plot_leave1[[1]], file="snoring_CAD_leaveoneout.pdf", width=7, height=7)
+
+p1<-mr_scatter_plot1(res, dat)
+p1
+ggsave(p1[[1]], file="snoring_CAD_scatterplot.pdf", width=7, height=7)
+res_single <- mr_singlesnp(dat, all_method = c("mr_ivw"))
+p2 <- mr_forest_plot1(res_single)
+p2
+ggsave(p2[[1]], file="snoring_CAD_singleplot.pdf", width=7, height=7)
+p3 <- mr_funnel_plot(res_single)
+p3
+
+
+
+
+
+
+
+
+
+#MI
+
+MI <- read_outcome_data(snps = exp_dat$SNP,
+                        filename = "C:/Users/86132/Desktop/????/snoring2CAD_check/data/MI_BBJ_tsmr.txt",
+                        sep = "\t",                          
+                        snp_col = "SNP",
+                        beta_col = "b",
+                        se_col = "se",
+                        effect_allele_col = "A2",
+                        other_allele_col = "A1",
+                        eaf_col = "freq",
+                        pval_col = "P",
+                        samplesize_col = "n",
+                        
+)
+
+dat <- harmonise_data(exposure_dat = exp_dat, outcome_dat = MI)
+dat$outcome ='MI'
+
+#MR Analysis
+set.seed(1000)
+res <- mr(dat,method_list = c('mr_ivw',
+                              'mr_weighted_median',
+                              'mr_egger_regression'))
+res.raps <- mr.raps(b_exp = dat$beta.exposure,
+                    b_out = dat$beta.outcome,
+                    se_exp = dat$se.exposure,
+                    se_out = dat$se.outcome)
+res.raps.result <- c(res$id.exposure[1], res$id.outcome[1], res$outcome[1], res$exposure[1], "RAPS", res$nsnp[1], res.raps$beta.hat, res.raps$beta.se, res.raps$beta.p.value)
+res <- rbind(res, res.raps.result)
+res$b <- as.numeric(res$b)
+res$se <- as.numeric(res$se)
+res$nsnp <- as.numeric(res$nsnp)
+res$method[1] <- "Inverse variance weighted"
+
+
+#???????? ln(1.5)?????????毡?为原来??1.5??时...
+res$OR.adj <- exp(res$b*0.405)
+res$OR.adj_L <- exp((res$b - 1.96*res$se)*0.405)
+res$OR.adj_U <- exp((res$b + 1.96*res$se)*0.405)
+
+result_MI<-cbind(res$method, res$nsnp, res$OR.adj, res$OR.adj_L, res$OR.adj_U,res$pval)
+
+colnames(result_MI) <- c("method","nsnp","OR.adj","OR.adj_L","OR.adj_U","P")
+rownames(result_MI) <- res$outcome 
+
+
+
+#pleiotropy test
+pleio <- mr_pleiotropy_test(dat)
+pleio
+
+#heterogeneity test
+het <- mr_heterogeneity(dat)
+het
+
+#MR Steiger
+out <- directionality_test(dat)
+out
+kable(out)
+
+#F-Statistics
+R2=out$snp_r2.exposure
+n=dat$samplesize.exposure[1] #注???薷????????
+k=res$nsnp[1]
+F = R2/(1-R2) * (n-k-1)/k
+F
+
+test_MI <- cbind(pleio$exposure, pleio$outcome, F, pleio$egger_intercept, 
+                 pleio$se, pleio$pval, het$Q[2], het$Q_pval[2], out$snp_r2.exposure,
+                 out$snp_r2.outcome, out$correct_causal_direction, out$steiger_pval)
+colnames(test_MI) <- c("Exposure","Outcome","F","Egger.inter",
+                       "Egger.SE","P.inter","Q","P.heterogeneity","snp_r2.exposure",
+                       "snp_r2.outcome","Direction","P.Steiger")
+
+
+setwd("C:/Users/86132/Desktop/????/snoring2CAD_check/2sampleMR/plots")
+single <- mr_leaveoneout(dat, method = mr_ivw) #default????IVW
+single
+plot_leave1 <- mr_leaveoneout_plot1(single)
+plot_leave1
+ggsave(plot_leave1[[1]], file="snoring_MI_leaveoneout.pdf", width=7, height=7)
+
+p1<-mr_scatter_plot1(res, dat)
+p1
+ggsave(p1[[1]], file="snoring_MI_scatterplot.pdf", width=7, height=7)
+res_single <- mr_singlesnp(dat, all_method = c("mr_ivw"))
+p2 <- mr_forest_plot1(res_single)
+p2
+ggsave(p2[[1]], file="snoring_MI_singleplot.pdf", width=7, height=7)
+p3 <- mr_funnel_plot(res_single)
+p3
+
+
+
+
+
+
+
+
+###CHF
+CHF <- read_outcome_data(snps = exp_dat$SNP,
+                         filename = "C:/Users/86132/Desktop/????/snoring2CAD_check/data/CHF_BBJ_tsmr.txt",
+                         sep = "\t",                          
+                         snp_col = "SNP",
+                         beta_col = "b",
+                         se_col = "se",
+                         effect_allele_col = "A2",
+                         other_allele_col = "A1",
+                         eaf_col = "freq",
+                         pval_col = "P",
+                         samplesize_col = "n"
+                         
+)
+
+
+
+
+dat <- harmonise_data(exposure_dat = exp_dat, outcome_dat = CHF)
+dat$outcome ='CHF'
+#MR Analysis
+set.seed(1000)
+res <- mr(dat,method_list = c('mr_ivw',
+                              'mr_weighted_median',
+                              'mr_egger_regression'))
+res.raps <- mr.raps(b_exp = dat$beta.exposure,
+                    b_out = dat$beta.outcome,
+                    se_exp = dat$se.exposure,
+                    se_out = dat$se.outcome)
+res.raps.result <- c(res$id.exposure[1], res$id.outcome[1], res$outcome[1], res$exposure[1], "RAPS", res$nsnp[1], res.raps$beta.hat, res.raps$beta.se, res.raps$beta.p.value)
+res <- rbind(res, res.raps.result)
+res$b <- as.numeric(res$b)
+res$se <- as.numeric(res$se)
+res$nsnp <- as.numeric(res$nsnp)
+res$method[1] <- "Inverse variance weighted"
+
+
+#???????? ln(1.5)?????????毡?为原来??1.5??时...
+res$OR.adj <- exp(res$b*0.405)
+res$OR.adj_L <- exp((res$b - 1.96*res$se)*0.405)
+res$OR.adj_U <- exp((res$b + 1.96*res$se)*0.405)
+
+result_CHF<-cbind(res$method, res$nsnp, res$OR.adj, res$OR.adj_L, res$OR.adj_U,res$pval)
+
+colnames(result_CHF) <- c("method","nsnp","OR.adj","OR.adj_L","OR.adj_U","P")
+rownames(result_CHF) <- res$outcome 
+#pleiotropy test
+pleio <- mr_pleiotropy_test(dat)
+pleio
+
+#heterogeneity test
+het <- mr_heterogeneity(dat)
+het
+
+#MR Steiger
+out <- directionality_test(dat)
+out
+kable(out)
+
+#F-Statistics
+R2=out$snp_r2.exposure
+n=dat$samplesize.exposure[1] #注???薷????????
+k=res$nsnp[1]
+F = R2/(1-R2) * (n-k-1)/k
+F
+
+test_CHF <- cbind(pleio$exposure, pleio$outcome, F, pleio$egger_intercept, 
+                  pleio$se, pleio$pval, het$Q[2], het$Q_pval[2], out$snp_r2.exposure,
+                  out$snp_r2.outcome, out$correct_causal_direction, out$steiger_pval)
+colnames(test_CHF) <- c("Exposure","Outcome","F","Egger.inter",
+                        "Egger.SE","P.inter","Q","P.heterogeneity","snp_r2.exposure",
+                        "snp_r2.outcome","Direction","P.Steiger")
+
+
+setwd("C:/Users/86132/Desktop/????/snoring2CAD_check/2sampleMR/plots")
+single <- mr_leaveoneout(dat, method = mr_ivw) #default????IVW
+single
+plot_leave1 <- mr_leaveoneout_plot1(single)
+plot_leave1
+ggsave(plot_leave1[[1]], file="snoring_CHF_leaveoneout.pdf", width=7, height=7)
+
+p1<-mr_scatter_plot1(res, dat)
+p1
+ggsave(p1[[1]], file="snoring_CHF_scatterplot.pdf", width=7, height=7)
+res_single <- mr_singlesnp(dat, all_method = c("mr_ivw"))
+p2 <- mr_forest_plot1(res_single)
+p2
+ggsave(p2[[1]], file="snoring_CHF_singleplot.pdf", width=7, height=7)
+p3 <- mr_funnel_plot(res_single)
+p3
+
+
+
+
+
+
+
+
+
+#####
+#????Angina???????偷慕????
+#Angina
+Angina <- read_outcome_data(snps = exp_dat$SNP,
+                            filename = "C:/Users/86132/Desktop/????/snoring2CAD_check/data/Angina_BBJ_tsmr.txt",
+                            sep = "\t",                          
+                            snp_col = "SNP",
+                            beta_col = "b",
+                            se_col = "se",
+                            effect_allele_col = "ALT",
+                            other_allele_col = "REF",
+                            eaf_col = "freq",
+                            pval_col = "P",
+                            samplesize_col = "n"
+                            
+)
+
+
+dat <- harmonise_data(exposure_dat = exp_dat, outcome_dat = Angina)
+dat$outcome ='Angina'
+
+#MR Analysis
+set.seed(1000)
+res <- mr(dat,method_list = c('mr_ivw',
+                              'mr_weighted_median',
+                              'mr_egger_regression'))
+res.raps <- mr.raps(b_exp = dat$beta.exposure,
+                    b_out = dat$beta.outcome,
+                    se_exp = dat$se.exposure,
+                    se_out = dat$se.outcome)
+res.raps.result <- c(res$id.exposure[1], res$id.outcome[1], res$outcome[1], res$exposure[1], "RAPS", res$nsnp[1], res.raps$beta.hat, res.raps$beta.se, res.raps$beta.p.value)
+res <- rbind(res, res.raps.result)
+res$b <- as.numeric(res$b)
+res$se <- as.numeric(res$se)
+res$nsnp <- as.numeric(res$nsnp)
+res$method[1] <- "Inverse variance weighted"
+
+
+#???????? ln(1.5)?????????毡?为原来??1.5??时...
+res$OR.adj <- exp(res$b*0.405)
+res$OR.adj_L <- exp((res$b - 1.96*res$se)*0.405)
+res$OR.adj_U <- exp((res$b + 1.96*res$se)*0.405)
+
+result_Angina<-cbind(res$method, res$nsnp, res$OR.adj, res$OR.adj_L, res$OR.adj_U,res$pval)
+
+colnames(result_Angina) <- c("method","nsnp","OR.adj","OR.adj_L","OR.adj_U","P")
+rownames(result_Angina) <- res$outcome 
+
+
+#pleiotropy test
+pleio <- mr_pleiotropy_test(dat)
+pleio
+
+#heterogeneity test
+het <- mr_heterogeneity(dat)
+het
+
+#MR Steiger
+out <- directionality_test(dat)
+out
+kable(out)
+
+#F-Statistics
+R2=out$snp_r2.exposure
+n=dat$samplesize.exposure[1] #注???薷????????
+k=res$nsnp[1]
+F = R2/(1-R2) * (n-k-1)/k
+F
+
+test_Angina <- cbind(pleio$exposure, pleio$outcome, F, pleio$egger_intercept, 
+                     pleio$se, pleio$pval, het$Q[2], het$Q_pval[2], out$snp_r2.exposure,
+                     out$snp_r2.outcome, out$correct_causal_direction, out$steiger_pval)
+colnames(test_Angina) <- c("Exposure","Outcome","F","Egger.inter",
+                           "Egger.SE","P.inter","Q","P.heterogeneity","snp_r2.exposure",
+                           "snp_r2.outcome","Direction","P.Steiger")
+
+
+setwd("C:/Users/86132/Desktop/????/snoring2CAD_check/2sampleMR/plots")
+single <- mr_leaveoneout(dat, method = mr_ivw) #default????IVW
+single
+plot_leave1 <- mr_leaveoneout_plot1(single)
+plot_leave1
+ggsave(plot_leave1[[1]], file="snoring_Angina_leaveoneout.pdf", width=7, height=7)
+
+p1<-mr_scatter_plot1(res, dat)
+p1
+ggsave(p1[[1]], file="snoring_Angina_scatterplot.pdf", width=7, height=7)
+res_single <- mr_singlesnp(dat, all_method = c("mr_ivw"))
+p2 <- mr_forest_plot1(res_single)
+p2
+ggsave(p2[[1]], file="snoring_Angina_singleplot.pdf", width=7, height=7)
+p3 <- mr_funnel_plot(res_single)
+p3
+
+
+
+
+
+
+###SAP
+#SAP
+SAP <- read_outcome_data(snps = exp_dat$SNP,
+                         filename = "C:/Users/86132/Desktop/????/snoring2CAD_check/data/SAP_BBJ_tsmr.txt",
+                         sep = "\t",                          
+                         snp_col = "SNP",
+                         beta_col = "b",
+                         se_col = "se",
+                         effect_allele_col = "ALT",
+                         other_allele_col = "REF",
+                         eaf_col = "freq",
+                         pval_col = "P",
+                         samplesize_col = "n"
+                         
+)
+
+
+dat <- harmonise_data(exposure_dat = exp_dat, outcome_dat = SAP)
+dat$outcome ='SAP'
+
+set.seed(1000)
+res <- mr(dat,method_list = c('mr_ivw',
+                              'mr_weighted_median',
+                              'mr_egger_regression'))
+res.raps <- mr.raps(b_exp = dat$beta.exposure,
+                    b_out = dat$beta.outcome,
+                    se_exp = dat$se.exposure,
+                    se_out = dat$se.outcome)
+res.raps.result <- c(res$id.exposure[1], res$id.outcome[1], res$outcome[1], res$exposure[1], "RAPS", res$nsnp[1], res.raps$beta.hat, res.raps$beta.se, res.raps$beta.p.value)
+res <- rbind(res, res.raps.result)
+res$b <- as.numeric(res$b)
+res$se <- as.numeric(res$se)
+res$nsnp <- as.numeric(res$nsnp)
+res$method[1] <- "Inverse variance weighted"
+
+
+#???????? ln(1.5)?????????毡?为原来??1.5??时...
+res$OR.adj <- exp(res$b*0.405)
+res$OR.adj_L <- exp((res$b - 1.96*res$se)*0.405)
+res$OR.adj_U <- exp((res$b + 1.96*res$se)*0.405)
+
+result_SAP<-cbind(res$method, res$nsnp, res$OR.adj, res$OR.adj_L, res$OR.adj_U,res$pval)
+
+colnames(result_SAP) <- c("method","nsnp","OR.adj","OR.adj_L","OR.adj_U","P")
+rownames(result_SAP) <- res$outcome 
+
+
+#pleiotropy test
+pleio <- mr_pleiotropy_test(dat)
+pleio
+
+#heterogeneity test
+het <- mr_heterogeneity(dat)
+het
+
+#MR Steiger
+out <- directionality_test(dat)
+out
+kable(out)
+
+#F-Statistics
+R2=out$snp_r2.exposure
+n=dat$samplesize.exposure[1] #注???薷????????
+k=res$nsnp[1]
+F = R2/(1-R2) * (n-k-1)/k
+F
+
+test_SAP <- cbind(pleio$exposure, pleio$outcome, F, pleio$egger_intercept, 
+                  pleio$se, pleio$pval, het$Q[2], het$Q_pval[2], out$snp_r2.exposure,
+                  out$snp_r2.outcome, out$correct_causal_direction, out$steiger_pval)
+colnames(test_SAP) <- c("Exposure","Outcome","F","Egger.inter",
+                        "Egger.SE","P.inter","Q","P.heterogeneity","snp_r2.exposure",
+                        "snp_r2.outcome","Direction","P.Steiger")
+
+
+setwd("C:/Users/86132/Desktop/????/snoring2CAD_check/2sampleMR/plots")
+single <- mr_leaveoneout(dat, method = mr_ivw) #default????IVW
+single
+plot_leave1 <- mr_leaveoneout_plot1(single)
+plot_leave1
+ggsave(plot_leave1[[1]], file="snoring_SAP_leaveoneout.pdf", width=7, height=7)
+
+p1<-mr_scatter_plot1(res, dat)
+p1
+ggsave(p1[[1]], file="snoring_SAP_scatterplot.pdf", width=7, height=7)
+res_single <- mr_singlesnp(dat, all_method = c("mr_ivw"))
+p2 <- mr_forest_plot1(res_single)
+p2
+ggsave(p2[[1]], file="snoring_SAP_singleplot.pdf", width=7, height=7)
+p3 <- mr_funnel_plot(res_single)
+p3
+
+
+
+
+
+
+
+
+###UAP
+#UAP
+UAP <- read_outcome_data(snps = exp_dat$SNP,
+                         filename = "C:/Users/86132/Desktop/????/snoring2CAD_check/data/UAP_BBJ_tsmr.txt",
+                         sep = "\t",                          
+                         snp_col = "SNP",
+                         beta_col = "b",
+                         se_col = "se",
+                         effect_allele_col = "ALT",
+                         other_allele_col = "REF",
+                         eaf_col = "freq",
+                         pval_col = "P",
+                         samplesize_col = "n"
+                         
+)
+
+
+dat <- harmonise_data(exposure_dat = exp_dat, outcome_dat = UAP)
+dat$outcome ='UAP'
+
+#MR Analysis
+set.seed(1000)
+res <- mr(dat,method_list = c('mr_ivw',
+                              'mr_weighted_median',
+                              'mr_egger_regression'))
+res.raps <- mr.raps(b_exp = dat$beta.exposure,
+                    b_out = dat$beta.outcome,
+                    se_exp = dat$se.exposure,
+                    se_out = dat$se.outcome)
+res.raps.result <- c(res$id.exposure[1], res$id.outcome[1], res$outcome[1], res$exposure[1], "RAPS", res$nsnp[1], res.raps$beta.hat, res.raps$beta.se, res.raps$beta.p.value)
+res <- rbind(res, res.raps.result)
+res$b <- as.numeric(res$b)
+res$se <- as.numeric(res$se)
+res$nsnp <- as.numeric(res$nsnp)
+res$method[1] <- "Inverse variance weighted"
+
+
+#???????? ln(1.5)?????????毡?为原来??1.5??时...
+res$OR.adj <- exp(res$b*0.405)
+res$OR.adj_L <- exp((res$b - 1.96*res$se)*0.405)
+res$OR.adj_U <- exp((res$b + 1.96*res$se)*0.405)
+
+result_UAP<-cbind(res$method, res$nsnp, res$OR.adj, res$OR.adj_L, res$OR.adj_U,res$pval)
+
+colnames(result_UAP) <- c("method","nsnp","OR.adj","OR.adj_L","OR.adj_U","P")
+rownames(result_UAP) <- res$outcome 
+
+
+#pleiotropy test
+pleio <- mr_pleiotropy_test(dat)
+pleio
+
+#heterogeneity test
+het <- mr_heterogeneity(dat)
+het
+
+#MR Steiger
+out <- directionality_test(dat)
+out
+kable(out)
+
+#F-Statistics
+R2=out$snp_r2.exposure
+n=dat$samplesize.exposure[1] #注???薷????????
+k=res$nsnp[1]
+F = R2/(1-R2) * (n-k-1)/k
+F
+
+test_UAP <- cbind(pleio$exposure, pleio$outcome, F, pleio$egger_intercept, 
+                  pleio$se, pleio$pval, het$Q[2], het$Q_pval[2], out$snp_r2.exposure,
+                  out$snp_r2.outcome, out$correct_causal_direction, out$steiger_pval)
+colnames(test_UAP) <- c("Exposure","Outcome","F","Egger.inter",
+                        "Egger.SE","P.inter","Q","P.heterogeneity","snp_r2.exposure",
+                        "snp_r2.outcome","Direction","P.Steiger")
+
+
+setwd("C:/Users/86132/Desktop/????/snoring2CAD_check/2sampleMR/plots")
+single <- mr_leaveoneout(dat, method = mr_ivw) #default????IVW
+single
+plot_leave1 <- mr_leaveoneout_plot1(single)
+plot_leave1
+ggsave(plot_leave1[[1]], file="snoring_UAP_leaveoneout.pdf", width=7, height=7)
+
+p1<-mr_scatter_plot1(res, dat)
+p1
+ggsave(p1[[1]], file="snoring_UAP_scatterplot.pdf", width=7, height=7)
+res_single <- mr_singlesnp(dat, all_method = c("mr_ivw"))
+p2 <- mr_forest_plot1(res_single)
+p2
+ggsave(p2[[1]], file="snoring_UAP_singleplot.pdf", width=7, height=7)
+p3 <- mr_funnel_plot(res_single)
+p3
+
+
+
+
+
+#?喜?????
+result <- rbind(result_CAD, result_MI, result_CHF, result_Angina, result_SAP, result_UAP)
+test <- rbind(test_CAD, test_MI, test_CHF, test_Angina, test_SAP, test_UAP)
+
+setwd("C:/Users/86132/Desktop/????/snoring2CAD_check/2sampleMR")
+write.csv(result, "3snps_snoring_CAD.csv")
+write.csv(test, "3snps_snoring_CAD_test.csv")
